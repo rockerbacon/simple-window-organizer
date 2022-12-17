@@ -1,0 +1,10 @@
+{
+ "description": "Keeps your windows organized across multiple workspaces.",
+ "name": "Simple Window Organizer",
+ "original-author": "vitor.santos@lab309.com.br",
+ "settings-schema": "org.gnome.shell.extensions.simple-window-organizer",
+ "shell-version": [ "43" ],
+ "url": "https://github.com/rockerbacon/simple-window-organizer",
+ "uuid": "simple-window-organizer@lab309.com.br",
+ "version": 1
+}

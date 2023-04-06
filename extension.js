@@ -14,60 +14,96 @@ class WindowMover {
     constructor() {
         this._settings = ExtensionUtils.getSettings();
         this._appSystem = Shell.AppSystem.get_default();
-        this._appConfigs = new Map();
-        this._appData = new Map();
+        this._windowTracker = Shell.WindowTracker.get_default();
+        this._appSettings = {};
+        this._appState = {};
 
-        this._appsChangedId =
-            this._appSystem.connect('installed-changed',
-                this._updateAppData.bind(this));
-
-        this._settings.connect('changed', this._updateAppConfigs.bind(this));
-        this._updateAppConfigs();
+        this._readAppSettings();
 
         this._lastStartedApp = null;
         this._lastAppStart = 0;
         this._suspendWorkspaceActivationUntil = 0;
 
+        this._saveAppSettingsTimeout = null;
+
         this._appsStateChangedId =
             this._appSystem.connect('app-state-changed',
                 this._appStateChanged.bind(this));
 
+        this._workspaceTrackers = {};
+
+        this._workspaceAddedId =
+            global.workspace_manager.connect(
+                'workspace-added',
+                this._trackWorkspaceWindows.bind(this)
+            );
+
+        this._workspaceRemovedId =
+            global.workspace_manager.connect(
+                'workspace-removed',
+                this._untrackWorkspaceWindows.bind(this)
+            );
+
+        for (let i = 0; i < global.workspace_manager.get_n_workspaces(); i++) {
+            this._trackWorkspaceWindows(global.workspace_manager, i);
+        }
     }
 
-    _updateAppConfigs() {
-        this._appConfigs.clear();
+    _trackWorkspaceWindows(workspaceManager, workspaceIndex) {
+        if (this._workspaceTrackers[workspaceIndex]) {
+            return;
+        }
 
-        this._settings.get_strv('application-list').forEach(v => {
-            let [appId, num] = v.split(':');
-            this._appConfigs.set(appId, parseInt(num) - 1);
-        });
-
-        this._updateAppData();
+        const workspace = workspaceManager.get_workspace_by_index(workspaceIndex);
+        this._workspaceTrackers[workspaceIndex] =
+            workspace.connect(
+                'window-added',
+                this._registerWindowAddedToWorkspace.bind(this)
+            );
     }
 
-    _updateAppData() {
-        let ids = [...this._appConfigs.keys()];
-        let removedApps = [...this._appData.keys()]
-            .filter(a => !ids.includes(a.id));
-        removedApps.forEach(app => {
-            app.disconnect(this._appData.get(app).windowsChangedId);
-            this._appData.delete(app);
-        });
+    _untrackWorkspaceWindows(workspaceManager, workspaceIndex) {
+        const tracker = this._workspaceTrackers[workspaceIndex];
+        if (!tracker) {
+            return;
+        }
 
-        let addedApps = ids
-            .map(id => this._appSystem.lookup_app(id))
-            .filter(app => app && !this._appData.has(app));
+        const workspace = workspaceManager.get_workspace_by_index(workspaceIndex);
+        if (workspace) {
+            workspace.disconnect(tracker);
+        }
 
-        addedApps.forEach(app => {
-            let data = {
+        delete this._workspaceTrackers[workspaceIndex];
+    }
+
+    _readAppSettings() {
+        const settingsValue = this._settings.get_string('application-settings');
+
+        this._appSettings = JSON.parse(settingsValue);
+    }
+
+    _getPreviousAppState(app) {
+        let state = this._appState[app.id];
+
+        if (!state) {
+            state = {
+                app,
+                state: Shell.AppState.STOPPED,
                 windowsChangedId: app.connect('windows-changed',
                     this._appWindowsChanged.bind(this)),
-                moveWindowsId: 0,
-                windows: app.get_windows(),
-                state: app.state,
-            };
-            this._appData.set(app, data);
-        });
+            }
+            this._appState[app.id] = state;
+        }
+
+        return state;
+    }
+
+    _disconnectAppEvents() {
+        for (const [id, state] of Object.entries(this._appState)) {
+            if (state.windowsChangedId) {
+                state.app.disconnect(state.windowsChangedId);
+            }
+        }
     }
 
     destroy() {
@@ -81,40 +117,31 @@ class WindowMover {
             this._appsStateChangedId = 0;
         }
 
+        if (this._saveAppSettingsTimeout) {
+            this._saveAppSettingsTimeout.destroy();
+            this._saveAppSettings();
+        }
+
         if (this._settings) {
             this._settings.run_dispose();
             this._settings = null;
         }
 
-        this._appConfigs.clear();
-        this._updateAppData();
+        for (const workspaceIndex of Object.keys(this._workspaceTrackers)) {
+            this._untrackWorkspaceWindows(global.workspace_manager, workspaceIndex);
+        }
+        this._workspaceTrackers = {};
+
+        this._disconnectAppEvents();
+        this._appSettings = {};
+        this._appState = {};
     }
-
-    _listNewWindows(knownWindows, allWindows) {
-        return allWindows.filter(w => !knownWindows.includes(w));
-    }
-
-    _hasNewWindows(app) {
-        let data = this._appData.get(app);
-
-        let newWindows = this._listNewWindows(data.windows, app.get_windows());
-
-        return newWindows.length > 0;
-    }
-
 
     _appStateChanged(appSystem, app) {
-        let data = this._appData.get(app);
-
-        if (!data) {
-            return;
-        }
+        let previousState = this._getPreviousAppState(app);
 
         if (
-            (
-                data.state === Shell.AppState.STOPPED ||
-                this._hasNewWindows(app)
-            ) &&
+            previousState.state === Shell.AppState.STOPPED &&
             app.state !== Shell.AppState.STOPPED &&
             this._lastStartedApp !== app
         ) {
@@ -129,7 +156,7 @@ class WindowMover {
             }
         }
 
-        data.state = app.state;
+        previousState.state = app.state;
     }
 
     _activateWorkspace(workspaceNum) {
@@ -138,90 +165,125 @@ class WindowMover {
         metaWorkspace.activate(global.get_current_time());
     }
 
-    _moveWindow(window, workspaceNum) {
-        if (window.skip_taskbar || window.is_on_all_workspaces())
-            return;
+    _ensureWorkspaceExists(window, workspaceNum) {
+        const lastWorkspace = global.workspace_manager.get_n_workspaces();
 
-        // ensure we have the required number of workspaces
-        let workspaceManager = global.workspace_manager;
-        for (let i = workspaceManager.n_workspaces; i <= workspaceNum; i++) {
+        for (let i = lastWorkspace; i <= workspaceNum; i++) {
             window.change_workspace_by_index(i - 1, false);
-            workspaceManager.append_new_workspace(false, 0);
+            global.workspaceManager.append_new_workspace(false, 0);
         }
+    }
 
+    _moveWindow(window, workspaceNum, app) {
+        log(JSON.stringify({
+            action: 'SWO - MOVE WINDOW',
+            app: app.id,
+            workspace: workspaceNum,
+        }));
+
+        this._ensureWorkspaceExists(window, workspaceNum);
         window.change_workspace_by_index(workspaceNum, false);
     }
 
-    _appWindowsChanged(app) {
-        let data = this._appData.get(app);
-        let windows = app.get_windows();
+    _getAppSettings(app) {
+        let settings = this._appSettings[app.id];
 
-        // If get_compositor_private() returns non-NULL on a removed windows,
-        // the window still exists and is just moved to a different workspace
-        // or something; assume it'll be added back immediately, so keep it
-        // to avoid moving it again
-        windows.push(...data.windows.filter(w => {
-            return !windows.includes(w) && w.get_compositor_private() !== null;
-        }));
+        if (!settings) {
+            settings = {
+                workspaceNum: global.workspace_manager.get_active_workspace_index(),
+            }
 
-        let workspaceNum = this._appConfigs.get(app.id);
-
-        let newWindows = this._listNewWindows(data.windows, windows);
-        newWindows.forEach(window => {
-            this._moveWindow(window, workspaceNum);
-        });
-
-        if (
-            newWindows.length &&
-            Date.now() > this._suspendWorkspaceActivationUntil
-        ) {
-            this._activateWorkspace(workspaceNum);
+            this._appSettings[app.id] = settings;
         }
 
-        data.windows = windows;
+        return settings;
+    }
+
+    _saveAppSettings() {
+        this._settings.set_string(
+            'application-settings',
+            JSON.stringify(this._appSettings)
+        );
+
+        if (this._saveAppSettingsTimeout) {
+            this._saveAppSettingsTimeout = null;
+        }
+    }
+
+    _scheduleSaveAppSettings() {
+        if (this._saveAppSettingsTimeout) {
+            return;
+        }
+
+        this._saveAppSettingsTimeout = setTimeout(
+            this._saveAppSettings.bind(this),
+            60000
+        );
+    }
+
+    _modifyAppWorkspaceNum(app, workspaceNum) {
+        log(JSON.stringify({
+            action: 'SWO -  SET APP WORKSPACE',
+            app: app.id,
+            workspace: workspaceNum,
+        }));
+        const settings = this._getAppSettings(app);
+        settings.workspaceNum = workspaceNum;
+
+        this._scheduleSaveAppSettings();
+    }
+
+    _registerWindowAddedToWorkspace(workspace, window) {
+        const app = this._windowTracker.get_window_app(window);
+        if (!app) {
+            return;
+        }
+
+        this._modifyAppWorkspaceNum(app, workspace.index());
+    }
+
+    _checkRequiresOrganization(windows, settings) {
+        return (
+            windows.some(w => w.get_workspace().index() !== settings.workspaceNum) &&
+            windows.every(w => !w.skip_taskbar) &&
+            windows.every(w => !w.is_on_all_workspaces())
+        );
+    }
+
+    _appWindowsChanged(app) {
+        const windows = app.get_windows();
+        const settings = this._getAppSettings(app);
+
+        if (
+            !this._checkRequiresOrganization(windows, settings)
+        ) {
+            return;
+        }
+
+        for (const window of windows) {
+            this._moveWindow(window, settings.workspaceNum, app);
+        }
+
+        if (
+            Date.now() > this._suspendWorkspaceActivationUntil
+        ) {
+            this._activateWorkspace(settings.workspaceNum);
+        }
     }
 }
 
-let prevCheckWorkspaces;
 let winMover;
 
 /** */
 function init() {
 }
 
-/**
- * @returns {bool} - false (used as MetaLater handler)
- */
-function myCheckWorkspaces() {
-    let keepAliveWorkspaces = [];
-    let foundNonEmpty = false;
-    for (let i = this._workspaces.length - 1; i >= 0; i--) {
-        if (!foundNonEmpty) {
-            foundNonEmpty = this._workspaces[i].list_windows().some(
-                w => !w.is_on_all_workspaces());
-        } else if (!this._workspaces[i]._keepAliveId) {
-            keepAliveWorkspaces.push(this._workspaces[i]);
-        }
-    }
-
-    // make sure the original method only removes empty workspaces at the end
-    keepAliveWorkspaces.forEach(ws => (ws._keepAliveId = 1));
-    prevCheckWorkspaces.call(this);
-    keepAliveWorkspaces.forEach(ws => delete ws._keepAliveId);
-
-    return false;
-}
-
 /** */
 function enable() {
-    prevCheckWorkspaces = Main.wm._workspaceTracker._checkWorkspaces;
-    Main.wm._workspaceTracker._checkWorkspaces = myCheckWorkspaces;
-
     winMover = new WindowMover();
 }
 
 /** */
 function disable() {
-    Main.wm._workspaceTracker._checkWorkspaces = prevCheckWorkspaces;
     winMover.destroy();
 }

@@ -8,7 +8,7 @@ const ExtensionUtils = imports.misc.extensionUtils;
 
 const _ = (str) => str;
 
-const SETTINGS_KEY = 'application-list';
+const SETTINGS_KEY = 'application-settings';
 
 const WORKSPACE_MAX = 36; // compiled in limit of mutter
 

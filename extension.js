@@ -18,12 +18,13 @@ class WindowMover {
         this._appSettings = {};
         this._appState = {};
 
-        this._settings.connect('changed', this._readAppSettings.bind(this));
         this._readAppSettings();
 
         this._lastStartedApp = null;
         this._lastAppStart = 0;
         this._suspendWorkspaceActivationUntil = 0;
+
+        this._saveAppSettingsTimeout = null;
 
         this._appsStateChangedId =
             this._appSystem.connect('app-state-changed',
@@ -53,13 +54,12 @@ class WindowMover {
             return;
         }
 
-        log(`SWO - TRACKING WORKSPACE ${workspaceIndex}`);
         const workspace = workspaceManager.get_workspace_by_index(workspaceIndex);
         this._workspaceTrackers[workspaceIndex] =
             workspace.connect(
                 'window-added',
                 this._registerWindowAddedToWorkspace.bind(this)
-            )
+            );
     }
 
     _untrackWorkspaceWindows(workspaceManager, workspaceIndex) {
@@ -67,9 +67,12 @@ class WindowMover {
         if (!tracker) {
             return;
         }
-        log(`SWO - UNTRACKING WORKSPACE ${workspaceIndex}`);
+
         const workspace = workspaceManager.get_workspace_by_index(workspaceIndex);
-        workspace.disconnect(tracker);
+        if (workspace) {
+            workspace.disconnect(tracker);
+        }
+
         delete this._workspaceTrackers[workspaceIndex];
     }
 
@@ -112,6 +115,11 @@ class WindowMover {
         if (this._appsStateChangedId) {
             this._appSystem.disconnect(this._appsStateChangedId);
             this._appsStateChangedId = 0;
+        }
+
+        if (this._saveAppSettingsTimeout) {
+            this._saveAppSettingsTimeout.destroy();
+            this._saveAppSettings();
         }
 
         if (this._settings) {
@@ -166,7 +174,13 @@ class WindowMover {
         }
     }
 
-    _moveWindow(window, workspaceNum) {
+    _moveWindow(window, workspaceNum, app) {
+        log(JSON.stringify({
+            action: 'SWO - MOVE WINDOW',
+            app: app.id,
+            workspace: workspaceNum,
+        }));
+
         this._ensureWorkspaceExists(window, workspaceNum);
         window.change_workspace_by_index(workspaceNum, false);
     }
@@ -185,21 +199,47 @@ class WindowMover {
         return settings;
     }
 
-    _registerWindowAddedToWorkspace(workspace, window) {
-        const app = this._windowTracker.get_window_app(window);
-        if (!app) {
-            log('COULD NOT FIND APP FOR WINDOW');
+    _saveAppSettings() {
+        this._settings.set_string(
+            'application-settings',
+            JSON.stringify(this._appSettings)
+        );
+
+        if (this._saveAppSettingsTimeout) {
+            this._saveAppSettingsTimeout = null;
+        }
+    }
+
+    _scheduleSaveAppSettings() {
+        if (this._saveAppSettingsTimeout) {
             return;
         }
 
-        const settings = this._getAppSettings(app);
-        settings.workspaceNum = workspace.index();
+        this._saveAppSettingsTimeout = setTimeout(
+            this._saveAppSettings.bind(this),
+            60000
+        );
+    }
 
+    _modifyAppWorkspaceNum(app, workspaceNum) {
         log(JSON.stringify({
-            action: 'SWO - ADD TO WORKSPACE',
+            action: 'SWO -  SET APP WORKSPACE',
             app: app.id,
-            workspace: settings.workspaceNum,
+            workspace: workspaceNum,
         }));
+        const settings = this._getAppSettings(app);
+        settings.workspaceNum = workspaceNum;
+
+        this._scheduleSaveAppSettings();
+    }
+
+    _registerWindowAddedToWorkspace(workspace, window) {
+        const app = this._windowTracker.get_window_app(window);
+        if (!app) {
+            return;
+        }
+
+        this._modifyAppWorkspaceNum(app, workspace.index());
     }
 
     _checkRequiresOrganization(windows, settings) {
@@ -211,11 +251,6 @@ class WindowMover {
     }
 
     _appWindowsChanged(app) {
-        log(JSON.stringify({
-            action: 'SWO - WINDOWS CHANGED',
-            app: app.id,
-        }));
-
         const windows = app.get_windows();
         const settings = this._getAppSettings(app);
 
@@ -226,7 +261,7 @@ class WindowMover {
         }
 
         for (const window of windows) {
-            this._moveWindow(window, settings.workspaceNum);
+            this._moveWindow(window, settings.workspaceNum, app);
         }
 
         if (
